@@ -9,97 +9,104 @@ permissions:
 
 env:
   PRIVATE_REPO: "LOM-PJ/LOM.Core"
-  EXCLUDE_LABEL_PREFIXES: "sync:"   # exclude anything starting with sync:
-  EXCLUDE_LABELS_EXACT: "sync:bot"  # also exclude this specific label
+  EXCLUDE_LABELS_EXACT: "sync:bot"
+  EXCLUDE_LABEL_PREFIX: "sync:"
 
 jobs:
   sync_labels:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Sync label change to private mirror
+      - name: Sync label change to private mirror (with retry)
         env:
           GH_TOKEN: ${{ secrets.ISSUESYNCTOKEN }}
           PUBLIC_REPO: ${{ github.repository }}
           PUBLIC_NUM: ${{ github.event.issue.number }}
-          ACTION: ${{ github.event.action }} # labeled | unlabeled
+          ACTION: ${{ github.event.action }}        # labeled | unlabeled
           LABEL_NAME: ${{ github.event.label.name }}
         run: |
           set -euo pipefail
 
-          # Exclusions (avoid loops / internal labels)
+          # Exclusions (avoid bot/internal labels)
           if [ "$LABEL_NAME" = "${EXCLUDE_LABELS_EXACT}" ]; then
-            echo "Excluded label: $LABEL_NAME"
+            echo "Excluded exact label: $LABEL_NAME"
             exit 0
           fi
           case "$LABEL_NAME" in
-            ${EXCLUDE_LABEL_PREFIXES}*) echo "Excluded label prefix: $LABEL_NAME"; exit 0 ;;
+            ${EXCLUDE_LABEL_PREFIX}*) echo "Excluded label prefix: $LABEL_NAME"; exit 0 ;;
           esac
 
-          # Fetch public issue to locate the private mapping line
-          public_json="$(curl -sS \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}")"
-
-          public_body="$(echo "$public_json" | jq -r '.body // ""')"
-
-          private_url="$(printf "%s" "$public_body" | sed -nE 's/^Private issue:\s*(https:\/\/github\.com\/[^ ]+\/issues\/[0-9]+).*$/\1/p' | head -n 1 || true)"
+          # Locate private mirror with retry to avoid races (e.g., label event before mapping exists)
           private_num=""
-          if [ -n "$private_url" ]; then
-            private_num="$(echo "$private_url" | awk -F/ '{print $7}')"
-          fi
 
-          # Fallback: search private repo by Sync-Key
-          if [ -z "$private_num" ]; then
-            q="$(jq -rn \
-              --arg repo "$PRIVATE_REPO" \
-              --arg num "$PUBLIC_NUM" \
-              '("repo:" + $repo + " in:body \"Sync-Key: public#" + $num + "\"") | @uri')"
-
-            search="$(curl -sS \
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            public_json="$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/search/issues?q=${q}")"
+              "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}")"
 
-            private_num="$(echo "$search" | jq -r '.items[0].number // empty')"
-          fi
+            public_body="$(echo "$public_json" | jq -r '.body // ""')"
+
+            private_url="$(printf "%s" "$public_body" | sed -nE 's/^Private issue:\s*(https:\/\/github\.com\/[^ ]+\/issues\/[0-9]+).*$/\1/p' | head -n 1 || true)"
+            if [ -n "$private_url" ]; then
+              private_num="$(echo "$private_url" | awk -F/ '{print $7}')"
+            fi
+
+            if [ -z "$private_num" ]; then
+              q="$(jq -rn \
+                --arg repo "$PRIVATE_REPO" \
+                --arg num "$PUBLIC_NUM" \
+                '("repo:" + $repo + " in:body \"Sync-Key: public#" + $num + "\"") | @uri')"
+
+              search="$(curl -sS \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/search/issues?q=${q}")"
+
+              private_num="$(echo "$search" | jq -r '.items[0].number // empty')"
+            fi
+
+            if [ -n "$private_num" ]; then
+              echo "Found private mirror issue #$private_num on attempt $attempt"
+              break
+            fi
+
+            echo "Private mirror not found yet (attempt $attempt); sleeping 2s..."
+            sleep 2
+          done
 
           if [ -z "$private_num" ]; then
-            echo "No private mirror found for public #${PUBLIC_NUM}."
+            echo "No private mirror found for public #${PUBLIC_NUM}. Skipping label sync."
             exit 0
           fi
 
-          echo "Private mirror issue: #$private_num"
-          echo "Action: $ACTION, Label: $LABEL_NAME"
-
-          # Ensure the label exists in the PRIVATE repo (create if missing)
-          # Note: label names must be URL-encoded
           label_encoded="$(jq -rn --arg s "$LABEL_NAME" '$s|@uri')"
-          label_get_status="$(curl -sS -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${PRIVATE_REPO}/labels/${label_encoded}" || true)"
-
-          if [ "$label_get_status" = "404" ]; then
-            echo "Label not found in private repo; creating: $LABEL_NAME"
-            # Create label with a default color (GitHub requires one). Pick a neutral.
-            curl -sS -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${PRIVATE_REPO}/labels" \
-              -d "$(jq -n --arg name "$LABEL_NAME" --arg color "cfd3d7" '{name:$name, color:$color}')" >/dev/null
-          fi
 
           if [ "$ACTION" = "labeled" ]; then
+            # Ensure label exists in private repo (create if missing)
+            status="$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${PRIVATE_REPO}/labels/${label_encoded}" || true)"
+
+            if [ "$status" = "404" ]; then
+              echo "Creating missing private label: $LABEL_NAME"
+              curl -sS -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${PRIVATE_REPO}/labels" \
+                -d "$(jq -n --arg name "$LABEL_NAME" --arg color "cfd3d7" '{name:$name, color:$color}')" >/dev/null || true
+            fi
+
             # Add label to private issue
             curl -sS -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${PRIVATE_REPO}/issues/${private_num}/labels" \
               -d "$(jq -n --arg l "$LABEL_NAME" '{labels:[$l]}')" >/dev/null
+
           else
-            # Remove label from private issue
+            # Remove label from private issue (best-effort)
             curl -sS -X DELETE \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
