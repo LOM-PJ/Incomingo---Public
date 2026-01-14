@@ -67,7 +67,14 @@ jobs:
 
           # Fallback: search private repo by Sync-Key if mapping not found
           if [ -z "$private_num" ]; then
-            q=$(python3 - << 'PY' import urllib.parse, os public_num=os.environ["PUBLIC_NUM"] repo=os.environ["PRIVATE_REPO"] query=f'repo:{repo} in:body "Sync-Key: public#{public_num}"' print(urllib.parse.quote(query)) PY )
+            q=$(python3 - << 'PY'
+import urllib.parse, os
+public_num=os.environ["PUBLIC_NUM"]
+repo=os.environ["PRIVATE_REPO"]
+query=f'repo:{repo} in:body "Sync-Key: public#{public_num}"'
+print(urllib.parse.quote(query))
+PY
+)
             search=$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
