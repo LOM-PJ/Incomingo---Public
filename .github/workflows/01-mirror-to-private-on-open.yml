@@ -1,0 +1,97 @@
+name: Mirror public issues to private (on open)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+env:
+  PRIVATE_REPO: LOM-PJ/LOM.Core
+  BOT_MARKER: "[SYNC BOT]"
+  SYNC_LABEL: "sync:bot"
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create private mirror issue
+        env:
+          GH_TOKEN: ${{ secrets.ISSUESYNCTOKEN }}
+          PUBLIC_REPO: ${{ github.repository }}
+          PUBLIC_NUM: ${{ github.event.issue.number }}
+          PUBLIC_URL: ${{ github.event.issue.html_url }}
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+
+          sync_key="public#${PUBLIC_NUM}"
+
+          private_body=$(jq -n \
+            --arg public_url "$PUBLIC_URL" \
+            --arg sync_key "$sync_key" \
+            --arg body "$BODY" \
+            '[
+              "Public issue: \($public_url)",
+              "Sync-Key: \($sync_key)",
+              "",
+              "---",
+              $body
+            ] | join("\n")')
+
+          resp=$(curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues" \
+            -d "$(jq -n --arg title "$TITLE" --arg body "$private_body" '{title:$title, body:$body}')" )
+
+          private_url=$(echo "$resp" | jq -r '.html_url')
+          private_num=$(echo "$resp" | jq -r '.number')
+
+          if [ -z "$private_url" ] || [ "$private_url" = "null" ]; then
+            echo "Failed to create private issue. Response:"
+            echo "$resp"
+            exit 1
+          fi
+
+          echo "Created private issue: $private_url (#$private_num)"
+
+          # 1) Comment on public issue with the private link
+          comment_body="${{ env.BOT_MARKER }} Created internal engineering issue: ${private_url}"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}/comments" \
+            -d "$(jq -n --arg body "$comment_body" '{body:$body}')"
+
+          # 2) Append mapping line to the public issue body (avoid duplicates)
+          current_body=$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}" | jq -r '.body // ""')
+
+          if echo "$current_body" | grep -qE '^Private issue:\s*https://github\.com/'; then
+            echo "Public issue already contains Private issue mapping; skipping patch."
+          else
+            patched_body=$(printf "%s\n\nPrivate issue: %s\n" "$current_body" "$private_url")
+            curl -sS -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}" \
+              -d "$(jq -n --arg body "$patched_body" '{body:$body}')"
+          fi
+
+          # 3) Add label to both sides (best-effort)
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}/labels" \
+            -d "$(jq -n --arg l "${{ env.SYNC_LABEL }}" '{labels:[$l]}')" >/dev/null || true
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues/${private_num}/labels" \
+            -d "$(jq -n --arg l "${{ env.SYNC_LABEL }}" '{labels:[$l]}')" >/dev/null || true
