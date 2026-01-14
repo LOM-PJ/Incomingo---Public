@@ -8,49 +8,59 @@ permissions:
   issues: write
 
 env:
-  PRIVATE_REPO: LOM-PJ/LOM.Core
+  PRIVATE_REPO: "LOM-PJ/LOM.Core"
   BOT_MARKER: "[SYNC BOT]"
   SYNC_LABEL: "sync:bot"
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Create private mirror issue
+      - name: Create private mirror issue (and copy initial labels)
         env:
           GH_TOKEN: ${{ secrets.ISSUESYNCTOKEN }}
           PUBLIC_REPO: ${{ github.repository }}
           PUBLIC_NUM: ${{ github.event.issue.number }}
-          PUBLIC_URL: ${{ github.event.issue.html_url }}
-          TITLE: ${{ github.event.issue.title }}
-          BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
 
+          # Fetch full public issue JSON (includes labels, body, title, url)
+          public_json="$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}")"
+
+          public_title="$(echo "$public_json" | jq -r '.title')"
+          public_body="$(echo "$public_json" | jq -r '.body // ""')"
+          public_url="$(echo "$public_json" | jq -r '.html_url')"
+
           sync_key="public#${PUBLIC_NUM}"
 
-          private_body=$(jq -n \
-            --arg public_url "$PUBLIC_URL" \
+          # Build private issue body (standard header + separator + public body)
+          private_body="$(jq -n \
+            --arg public_url "$public_url" \
             --arg sync_key "$sync_key" \
-            --arg body "$BODY" \
+            --arg body "$public_body" \
             '[
               "Public issue: \($public_url)",
               "Sync-Key: \($sync_key)",
               "",
               "---",
               $body
-            ] | join("\n")')
+            ] | join("\n")')"
 
-          resp=$(curl -sS -X POST \
+          # Create private issue
+          resp="$(curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues" \
-            -d "$(jq -n --arg title "$TITLE" --arg body "$private_body" '{title:$title, body:$body}')" )
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues" \
+            -d "$(jq -n --arg title "$public_title" --arg body "$private_body" '{title:$title, body:$body}')" )"
 
-          private_url=$(echo "$resp" | jq -r '.html_url')
-          private_num=$(echo "$resp" | jq -r '.number')
+          private_url="$(echo "$resp" | jq -r '.html_url')"
+          private_num="$(echo "$resp" | jq -r '.number')"
 
-          if [ -z "$private_url" ] || [ "$private_url" = "null" ]; then
+          if [ -z "$private_url" ] || [ "$private_url" = "null" ] || [ -z "$private_num" ] || [ "$private_num" = "null" ]; then
             echo "Failed to create private issue. Response:"
             echo "$resp"
             exit 1
@@ -58,24 +68,66 @@ jobs:
 
           echo "Created private issue: $private_url (#$private_num)"
 
-          # 1) Comment on public issue with the private link
-          comment_body="${{ env.BOT_MARKER }} Created internal engineering issue: ${private_url}"
+          # ----------------------------
+          # Copy INITIAL labels (public -> private)
+          # Exclude sync:bot and anything starting with sync:
+          # ----------------------------
+          echo "$public_json" | jq -r '.labels[].name' | while IFS= read -r label_name; do
+            # Skip empties (defensive)
+            [ -z "$label_name" ] && continue
+
+            # Exclusions
+            if [ "$label_name" = "${SYNC_LABEL}" ]; then
+              echo "Skipping excluded label: $label_name"
+              continue
+            fi
+            case "$label_name" in
+              sync:*) echo "Skipping excluded label prefix: $label_name"; continue ;;
+            esac
+
+            label_encoded="$(jq -rn --arg s "$label_name" '$s|@uri')"
+
+            # Ensure label exists in private repo (create if missing)
+            status="$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${PRIVATE_REPO}/labels/${label_encoded}" || true)"
+
+            if [ "$status" = "404" ]; then
+              echo "Creating missing private label: $label_name"
+              curl -sS -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${PRIVATE_REPO}/labels" \
+                -d "$(jq -n --arg name "$label_name" --arg color "cfd3d7" '{name:$name, color:$color}')" >/dev/null || true
+            fi
+
+            # Apply label to private issue
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${PRIVATE_REPO}/issues/${private_num}/labels" \
+              -d "$(jq -n --arg l "$label_name" '{labels:[$l]}')" >/dev/null || true
+          done
+
+          # ----------------------------
+          # Comment back on the public issue with private link
+          # ----------------------------
+          comment_body="${BOT_MARKER} Created internal engineering issue: ${private_url}"
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}/comments" \
             -d "$(jq -n --arg body "$comment_body" '{body:$body}')"
 
-          # 2) Append mapping line to the public issue body (avoid duplicates)
-          current_body=$(curl -sS \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}" | jq -r '.body // ""')
-
-          if echo "$current_body" | grep -qE '^Private issue:\s*https://github\.com/'; then
-            echo "Public issue already contains Private issue mapping; skipping patch."
+          # ----------------------------
+          # Append mapping line to public issue body (avoid duplicates)
+          # ----------------------------
+          current_body="$(echo "$public_json" | jq -r '.body // ""')"
+          if printf "%s" "$current_body" | grep -qE '^Private issue:\s*https://github\.com/'; then
+            echo "Public issue already has Private issue mapping; skipping patch."
           else
-            patched_body=$(printf "%s\n\nPrivate issue: %s\n" "$current_body" "$private_url")
+            patched_body="$(printf "%s\n\nPrivate issue: %s\n" "$current_body" "$private_url")"
             curl -sS -X PATCH \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -83,15 +135,17 @@ jobs:
               -d "$(jq -n --arg body "$patched_body" '{body:$body}')"
           fi
 
-          # 3) Add label to both sides (best-effort)
+          # ----------------------------
+          # Best-effort: add sync label to both sides
+          # ----------------------------
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}/labels" \
-            -d "$(jq -n --arg l "${{ env.SYNC_LABEL }}" '{labels:[$l]}')" >/dev/null || true
+            -d "$(jq -n --arg l "${SYNC_LABEL}" '{labels:[$l]}')" >/dev/null || true
 
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues/${private_num}/labels" \
-            -d "$(jq -n --arg l "${{ env.SYNC_LABEL }}" '{labels:[$l]}')" >/dev/null || true
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${private_num}/labels" \
+            -d "$(jq -n --arg l "${SYNC_LABEL}" '{labels:[$l]}')" >/dev/null || true
