@@ -25,7 +25,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch full public issue JSON (includes labels, body, title, url)
           public_json="$(curl -sS \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -37,8 +36,8 @@ jobs:
 
           sync_key="public#${PUBLIC_NUM}"
 
-          # Build private issue body (standard header + separator + public body)
-          private_body="$(jq -n \
+          # IMPORTANT: use -r so this becomes raw multi-line text, not a JSON string with quotes/\n
+          private_body="$(jq -rn \
             --arg public_url "$public_url" \
             --arg sync_key "$sync_key" \
             --arg body "$public_body" \
@@ -50,7 +49,6 @@ jobs:
               $body
             ] | join("\n")')"
 
-          # Create private issue
           resp="$(curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -68,33 +66,25 @@ jobs:
 
           echo "Created private issue: $private_url (#$private_num)"
 
-          # ----------------------------
-          # Copy INITIAL labels (public -> private)
-          # Exclude sync:bot and anything starting with sync:
-          # ----------------------------
+          # Copy INITIAL labels (public -> private). Exclude sync labels.
           echo "$public_json" | jq -r '.labels[].name' | while IFS= read -r label_name; do
-            # Skip empties (defensive)
             [ -z "$label_name" ] && continue
 
-            # Exclusions
             if [ "$label_name" = "${SYNC_LABEL}" ]; then
-              echo "Skipping excluded label: $label_name"
               continue
             fi
             case "$label_name" in
-              sync:*) echo "Skipping excluded label prefix: $label_name"; continue ;;
+              sync:*) continue ;;
             esac
 
             label_encoded="$(jq -rn --arg s "$label_name" '$s|@uri')"
 
-            # Ensure label exists in private repo (create if missing)
             status="$(curl -sS -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${PRIVATE_REPO}/labels/${label_encoded}" || true)"
 
             if [ "$status" = "404" ]; then
-              echo "Creating missing private label: $label_name"
               curl -sS -X POST \
                 -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
@@ -102,7 +92,6 @@ jobs:
                 -d "$(jq -n --arg name "$label_name" --arg color "cfd3d7" '{name:$name, color:$color}')" >/dev/null || true
             fi
 
-            # Apply label to private issue
             curl -sS -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -110,9 +99,6 @@ jobs:
               -d "$(jq -n --arg l "$label_name" '{labels:[$l]}')" >/dev/null || true
           done
 
-          # ----------------------------
-          # Comment back on the public issue with private link
-          # ----------------------------
           comment_body="${BOT_MARKER} Created internal engineering issue: ${private_url}"
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -120,12 +106,9 @@ jobs:
             "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}/comments" \
             -d "$(jq -n --arg body "$comment_body" '{body:$body}')"
 
-          # ----------------------------
-          # Append mapping line to public issue body (avoid duplicates)
-          # ----------------------------
           current_body="$(echo "$public_json" | jq -r '.body // ""')"
           if printf "%s" "$current_body" | grep -qE '^Private issue:\s*https://github\.com/'; then
-            echo "Public issue already has Private issue mapping; skipping patch."
+            echo "Public issue already has mapping; skipping."
           else
             patched_body="$(printf "%s\n\nPrivate issue: %s\n" "$current_body" "$private_url")"
             curl -sS -X PATCH \
@@ -135,9 +118,7 @@ jobs:
               -d "$(jq -n --arg body "$patched_body" '{body:$body}')"
           fi
 
-          # ----------------------------
-          # Best-effort: add sync label to both sides
-          # ----------------------------
+          # Best-effort sync label both sides
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
