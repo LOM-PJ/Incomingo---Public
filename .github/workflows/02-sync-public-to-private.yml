@@ -10,102 +10,127 @@ permissions:
   issues: write
 
 env:
-  PRIVATE_REPO: LOM-PJ/LOM.Core
+  PRIVATE_REPO: "LOM-PJ/LOM.Core"
   BOT_MARKER: "[SYNC BOT]"
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Determine event context
-        id: ctx
+      - name: Debug event type
         run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            echo "kind=comment" >> $GITHUB_OUTPUT
-            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
-          else
-            echo "kind=issue" >> $GITHUB_OUTPUT
-            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
-          fi
+          echo "event_name=${{ github.event_name }}"
+          echo "actor=${{ github.actor }}"
+          echo "issue_number=${{ github.event.issue.number }}"
 
-      - name: Skip bot loopbacks
-        if: |
-          github.actor == 'github-actions[bot]' ||
-          (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, env.BOT_MARKER))
-        run: |
-          echo "Skipping bot-originated event."
-
-      - name: Sync to private
-        if: |
-          !(github.actor == 'github-actions[bot]' ||
-          (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, env.BOT_MARKER)))
+      - name: Mirror public comment to private
+        if: github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ secrets.ISSUESYNCTOKEN }}
           PUBLIC_REPO: ${{ github.repository }}
-          PUBLIC_NUM: ${{ steps.ctx.outputs.number }}
+          PUBLIC_NUM: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
 
-          # Fetch public issue to get mapping (Private issue URL) or sync-key
-          public_json=$(curl -sS \
+          comment_body="$(jq -r '.comment.body // ""' "$GITHUB_EVENT_PATH")"
+
+          # Loop prevention
+          if [ "${{ github.actor }}" = "github-actions[bot]" ]; then
+            echo "Skipping github-actions[bot]"
+            exit 0
+          fi
+          case "$comment_body" in
+            "${BOT_MARKER}"*) echo "Skipping bot-marker comment"; exit 0 ;;
+          esac
+
+          public_json="$(curl -sS \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}")
+            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}")"
 
-          public_title=$(echo "$public_json" | jq -r '.title')
-          public_body=$(echo "$public_json" | jq -r '.body // ""')
-          public_state=$(echo "$public_json" | jq -r '.state')
-          public_url=$(echo "$public_json" | jq -r '.html_url')
+          public_url="$(echo "$public_json" | jq -r '.html_url')"
+          public_body="$(echo "$public_json" | jq -r '.body // ""')"
 
-          # Try to find the private issue number via "Private issue:" mapping line
-          private_url=$(echo "$public_body" | sed -nE 's/^Private issue:\s*(https:\/\/github\.com\/[^ ]+\/issues\/[0-9]+).*$/\1/p' | head -n 1 || true)
+          private_url="$(printf "%s" "$public_body" | sed -nE 's/^Private issue:\s*(https:\/\/github\.com\/[^ ]+\/issues\/[0-9]+).*$/\1/p' | head -n 1 || true)"
           private_num=""
           if [ -n "$private_url" ]; then
-            private_num=$(echo "$private_url" | awk -F/ '{print $7}')
+            private_num="$(echo "$private_url" | awk -F/ '{print $7}')"
           fi
 
-          # Fallback: search private repo by Sync-Key if mapping not found
+          # Fallback: search by Sync-Key in private repo (URL-encode with jq, no Python)
           if [ -z "$private_num" ]; then
-            q=$(python3 - << 'PY'
-import urllib.parse, os
-public_num=os.environ["PUBLIC_NUM"]
-repo=os.environ["PRIVATE_REPO"]
-query=f'repo:{repo} in:body "Sync-Key: public#{public_num}"'
-print(urllib.parse.quote(query))
-PY
-)
-            search=$(curl -sS \
+            q="$(jq -rn \
+              --arg repo "$PRIVATE_REPO" \
+              --arg num "$PUBLIC_NUM" \
+              '("repo:" + $repo + " in:body \"Sync-Key: public#" + $num + "\"") | @uri')"
+
+            search="$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/search/issues?q=${q}")
-            private_num=$(echo "$search" | jq -r '.items[0].number // empty')
+              "https://api.github.com/search/issues?q=${q}")"
+
+            private_num="$(echo "$search" | jq -r '.items[0].number // empty')"
           fi
 
           if [ -z "$private_num" ]; then
-            echo "Could not locate private mirror issue for public #${PUBLIC_NUM}. Ensure mapping line exists."
+            echo "No private mirror found for public #${PUBLIC_NUM}. Ensure the public issue body includes 'Private issue: ...'"
             exit 0
           fi
 
-          echo "Target private issue #${private_num}"
+          mirrored="${BOT_MARKER} Mirrored from public ${public_url} ${comment_body}"
 
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            # Mirror public comment to private
-            comment_body="${{ github.event.comment.body }}"
-            mirrored="${{ env.BOT_MARKER }} Mirrored from public ${public_url}\n\n${comment_body}"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${private_num}/comments" \
+            -d "$(jq -n --arg body "$mirrored" '{body:$body}')"
 
-            curl -sS -X POST \
+      - name: Sync public issue changes to private
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          PUBLIC_REPO: ${{ github.repository }}
+          PUBLIC_NUM: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          public_json="$(curl -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/issues/${PUBLIC_NUM}")"
+
+          public_title="$(echo "$public_json" | jq -r '.title')"
+          public_body="$(echo "$public_json" | jq -r '.body // ""')"
+          public_state="$(echo "$public_json" | jq -r '.state')"
+          public_url="$(echo "$public_json" | jq -r '.html_url')"
+
+          private_url="$(printf "%s" "$public_body" | sed -nE 's/^Private issue:\s*(https:\/\/github\.com\/[^ ]+\/issues\/[0-9]+).*$/\1/p' | head -n 1 || true)"
+          private_num=""
+          if [ -n "$private_url" ]; then
+            private_num="$(echo "$private_url" | awk -F/ '{print $7}')"
+          fi
+
+          if [ -z "$private_num" ]; then
+            q="$(jq -rn \
+              --arg repo "$PRIVATE_REPO" \
+              --arg num "$PUBLIC_NUM" \
+              '("repo:" + $repo + " in:body \"Sync-Key: public#" + $num + "\"") | @uri')"
+
+            search="$(curl -sS \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues/${private_num}/comments" \
-              -d "$(jq -n --arg body "$mirrored" '{body:$body}')"
+              "https://api.github.com/search/issues?q=${q}")"
 
+            private_num="$(echo "$search" | jq -r '.items[0].number // empty')"
+          fi
+
+          if [ -z "$private_num" ]; then
+            echo "No private mirror found for public #${PUBLIC_NUM}."
             exit 0
           fi
 
-          # Issue edited/closed/reopened: keep private in sync with public state/title/body
-          # Build private body preserving the mapping header lines, then append public body.
-          new_private_body=$(jq -n \
+          new_private_body="$(jq -n \
             --arg public_url "$public_url" \
             --arg sync_key "public#${PUBLIC_NUM}" \
             --arg body "$public_body" \
@@ -115,19 +140,19 @@ PY
               "",
               "---",
               $body
-            ] | join("\n")')
+            ] | join("\n")')"
 
-          # Patch title/body
           curl -sS -X PATCH \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues/${private_num}" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${private_num}" \
             -d "$(jq -n --arg title "$public_title" --arg body "$new_private_body" '{title:$title, body:$body}')"
 
-          # Patch state
-          if [ "$public_state" = "closed" ]; then state="closed"; else state="open"; fi
+          state="open"
+          if [ "$public_state" = "closed" ]; then state="closed"; fi
+
           curl -sS -X PATCH \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ env.PRIVATE_REPO }}/issues/${private_num}" \
+            "https://api.github.com/repos/${PRIVATE_REPO}/issues/${private_num}" \
             -d "$(jq -n --arg state "$state" '{state:$state}')"
